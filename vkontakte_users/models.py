@@ -2,23 +2,25 @@
 from datetime import timedelta, date
 import logging
 
-from dateutil import parser
 from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
-from django.db import models, transaction
-from django.utils import timezone
+from django.db import models
+from django.utils import timezone, six
 from django.utils.encoding import python_2_unicode_compatible
 from vkontakte_api.api import api_call, VkontakteError
-from vkontakte_api.decorators import fetch_all
+from vkontakte_api.decorators import fetch_all, atomic
 from vkontakte_api.models import VkontakteManager, VkontaktePKModel
+from vkontakte_api.fields import JSONField
 from vkontakte_places.models import City, Country
 
 log = logging.getLogger('vkontakte_users')
 
 USERS_INFO_TIMEOUT_DAYS = getattr(settings, 'VKONTAKTE_USERS_INFO_TIMEOUT_DAYS', 0)
 
-USER_FIELDS = 'uid,first_name,last_name,nickname,screen_name,sex,bdate,city,country,timezone,photo,photo_medium,photo_big,has_mobile,rate,contacts,education,activity,relation,wall_comments,relatives,interests,movies,tv,books,games,about,connections,universities,schools'
-USER_SEX_CHOICES = ((1, u'жен.'), (2, u'муж.'))
+USER_FIELDS = 'uid,first_name,last_name,nickname,screen_name,sex,bdate,city,country,timezone,photo,photo_medium,' \
+              'photo_big,has_mobile,rate,contacts,education,activity,relation,wall_comments,relatives,interests,' \
+              'movies,tv,books,games,about,connections,universities,schools'
+USER_SEX_CHOICES = ((0, u'не ук.'), (1, u'жен.'), (2, u'муж.'))
 USER_RELATION_CHOICES = (
     (1, u'Не женат / замужем'),
     (2, u'Есть друг / подруга'),
@@ -41,13 +43,13 @@ def list_chunks_iterator(l, n):
 
 
 class ParseUsersMixin(object):
-
-    '''
+    """
     Manager mixin for parsing response with extra cache 'profiles'. Used in vkontakte_wall,vkontakte_board applications
-    '''
+    """
 
-    def parse_response_users(self, response_list):
-        users = User.remote.parse_response_list(response_list.get('profiles', []), {'fetched': timezone.now()})
+    def parse_response_users(self, response_list, items_field='profiles'):
+        users = User.remote.parse_response_list(response_list.get(items_field, []), {'fetched': timezone.now()})
+
         instances = []
         for instance in users:
             instances += [User.remote.get_or_create_from_instance(instance)]
@@ -69,11 +71,11 @@ class UsersManager(models.Manager):
         return self.filter(has_avatar=False)
 
 
-class UsersRemoteManager(VkontakteManager):
+class UsersRemoteManager(VkontakteManager, ParseUsersMixin):
 
     fetch_users_limit = 1000
 
-    @transaction.commit_on_success
+    @atomic
     def fetch_friends(self, user, only_existing_users=False, **kwargs):
 
         # send extra_fields with only_ids key for special mode of parsing response, used only in vkontakte_users.models
@@ -85,12 +87,12 @@ class UsersRemoteManager(VkontakteManager):
 
         return self.fetch(method='friends', uid=user.remote_id, **kwargs)
 
-    @transaction.commit_on_success
+    @atomic
     def fetch(self, **kwargs):
-        '''
+        """
         Additional attributes:
          * only_expired - flag to fetch only users, fetched earlie than VKONTAKTE_USERS_INFO_TIMEOUT_DAYS days ago
-        '''
+        """
         if 'only_expired' in kwargs and kwargs.pop('only_expired'):
             ids = kwargs['ids']
             expired_at = timezone.now() - timedelta(USERS_INFO_TIMEOUT_DAYS)
@@ -106,12 +108,13 @@ class UsersRemoteManager(VkontakteManager):
             return self._fetch(**kwargs)
 
     def _fetch(self, **kwargs):
-        '''
+        """
         Method gives ability to fetch more than 1000 users at once
-        '''
+        """
         ids = kwargs.pop('ids', None)
         if ids:
             kwargs_sliced = dict(kwargs)
+            users = []
             for chunk in list_chunks_iterator(ids, self.fetch_users_limit):
                 kwargs_sliced['ids'] = chunk
                 users = super(UsersRemoteManager, self).fetch(**kwargs_sliced)
@@ -121,19 +124,20 @@ class UsersRemoteManager(VkontakteManager):
             return super(UsersRemoteManager, self).fetch(**kwargs)
 
     def _renew_queryset(self, users, ids):
-        '''
+        """
         Return argument `users` if ammount of `users` is equal to ammount `ids` we need to fetch
-        '''
+        """
         if users is not None and len(ids) == users.count():
             return users
         else:
             return self.model.objects.filter(remote_id__in=ids)
 
     def api_call(self, method='get', **kwargs):
-        '''
+        """
         Override parent behaviour without namespace property
         TODO: move all kwargs manipulations to fetch method
-        '''
+        :param method:
+        """
         if 'fields' not in kwargs:
             kwargs['fields'] = USER_FIELDS
         if 'ids' in kwargs:
@@ -142,9 +146,10 @@ class UsersRemoteManager(VkontakteManager):
         return super(UsersRemoteManager, self).api_call(method, **kwargs)
 
     def get_by_slug(self, slug):
-        '''
+        """
         Return active user by slug
-        '''
+        :param slug:
+        """
         try:
             return super(UsersRemoteManager, self).get_by_slug(slug)
         except self.model.MultipleObjectsReturned:
@@ -158,40 +163,8 @@ class UsersRemoteManager(VkontakteManager):
         else:
             return super(UsersRemoteManager, self).parse_response_list(response_list, extra_fields)
 
-#    def get_or_create_from_instance(self, instance):
-# DatabaseError: invalid byte sequence for encoding "UTF8": 0xeda0bc
-# HINT:  This error can also happen if the byte sequence does not match the encoding expected by the server, which is controlled by "client_encoding".
-# u.activity = u'\u041d\u0430\u0448 \u043e\u0431\u0443\u0447\u0430\u044e\u0449\u0438\u0439 \u043a\u0443\u0440\u0441 &quot;\u041a\u0430\u043a \u0438\u0437\u0431\u0430\u0432\u0438\u0442\u044c\u0441\u044f \u043e\u0442 \u0438\u043d\u0442\u0435\u0440\u043d\u0435\u0442-\u0437\u0430\u0432\u0438\u0441\u0438\u043c\u043e\u0441\u0442\u0438&quot; - \u0442\u0435\u043f\u0435\u0440\u044c \u0438 \u0432 \u043e\u043d\u043b\u0430\u0439\u043d \u0432\u0430\u0440\u0438\u0430\u043d\u0442\u0435\ud83c\u2708\ud83d\U0001f4a8'
-#        if instance.remote_id != 59930666:
-#            try:
-#                super(UsersRemoteManager, self).get_or_create_from_instance(instance)
-#            except DatabaseError, e:
-#                log.error("Error while creating user with fields %s. Error: %s" % (instance.__dict__, e))
-#
-#        return instance
-
-#    def get(self, *args, **kwargs):
-#        '''
-#        Apply country param request to all instances in reponse
-#        '''
-#        country = None
-#
-#        if 'country' in kwargs and self.model._meta.get_field('country'):
-#            if isinstance(kwargs['country'], Country):
-#                country = kwargs['country']
-#            else:
-#                country = Country.objects.get(remote_id=kwargs['country'])
-#
-#        instances = super(VkontaktePlacesManager, self).get(*args, **kwargs)
-#
-#        if country:
-#            for instance in instances:
-#                instance.country = country
-#
-#        return instances
-
     @fetch_all(default_count=1000)
-    def fetch_likes_user_ids(self, likes_type, owner_id, item_id, offset=0, count=1000, filter='likes', *args, **kwargs):
+    def fetch_likes_user_ids(self, likes_type, owner_id, item_id, offset=0, count=1000, filter='likes', **kwargs):
         if count > 1000:
             raise ValueError("Parameter 'count' can not be more than 1000")
         if filter not in ['likes', 'copies']:
@@ -203,33 +176,40 @@ class UsersRemoteManager(VkontakteManager):
         # тип Like-объекта. Подробнее о типах объектов можно узнать на странице Список типов Like-объектов.
         kwargs['type'] = likes_type
         # owner_id
-        # идентификатор владельца Like-объекта (id пользователя или id приложения). Если параметр type равен sitepage, то в качестве owner_id необходимо передавать id приложения. Если параметр не задан, то считается, что он равен либо идентификатору текущего пользователя, либо идентификатору текущего приложения (если type равен sitepage).
+        # идентификатор владельца Like-объекта (id пользователя или id приложения). Если параметр type равен sitepage,
+        # то в качестве owner_id необходимо передавать id приложения. Если параметр не задан, то считается, что он
+        # равен либо идентификатору текущего пользователя, либо идентификатору текущего приложения (если type равен
+        # sitepage).
         kwargs['owner_id'] = owner_id
         # item_id
-        # идентификатор Like-объекта. Если type равен sitepage, то параметр item_id может содержать значение параметра page_id, используемый при инициализации виджета «Мне нравится».
+        # идентификатор Like-объекта. Если type равен sitepage, то параметр item_id может содержать значение параметра
+        # page_id, используемый при инициализации виджета «Мне нравится».
         kwargs['item_id'] = item_id
         # page_url
         # url страницы, на которой установлен виджет «Мне нравится». Используется вместо параметра item_id.
 
         # filter
-        # указывает, следует ли вернуть всех пользователей, добавивших объект в список "Мне нравится" или только тех, которые рассказали о нем друзьям. Параметр может принимать следующие значения:
+        # указывает, следует ли вернуть всех пользователей, добавивших объект в список "Мне нравится" или только тех,
+        # которые рассказали о нем друзьям. Параметр может принимать следующие значения:
         # likes – возвращать всех пользователей
         # copies – возвращать только пользователей, рассказавших об объекте друзьям
         # По умолчанию возвращаются все пользователи.
         kwargs['filter'] = filter
         # friends_only
-        # указывает, необходимо ли возвращать только пользователей, которые являются друзьями текущего пользователя. Параметр может принимать следующие значения:
+        # указывает, необходимо ли возвращать только пользователей, которые являются друзьями текущего пользователя.
+        # Параметр может принимать следующие значения:
         # 0 – возвращать всех пользователей в порядке убывания времени добавления объекта
         # 1 – возвращать только друзей текущего пользователя в порядке убывания времени добавления объекта
         # Если метод был вызван без авторизации или параметр не был задан, то считается, что он равен 0.
         kwargs['friends_only'] = 0
         # offset
-        # смещение, относительно начала списка, для выборки определенного подмножества. Если параметр не задан, то считается, что он равен 0.
+        # смещение, относительно начала списка, для выборки определенного подмножества. Если параметр не задан, то
+        # считается, что он равен 0.
         kwargs['offset'] = int(offset)
         # count
         # количество возвращаемых идентификаторов пользователей.
-        # Если параметр не задан, то считается, что он равен 100, если не задан параметр friends_only, в противном случае 10.
-        # Максимальное значение параметра 1000, если не задан параметр friends_only, в противном случае 100.
+        # Если параметр не задан, то считается, что он равен 100, если не задан параметр friends_only, в противном
+        # случае 10. Максимальное значение параметра 1000, если не задан параметр friends_only, в противном случае 100.
         kwargs['count'] = int(count)
 
         log.debug('Fetching like users ids of %s %s_%s, offset %d' % (likes_type, owner_id, item_id, offset))
@@ -237,11 +217,11 @@ class UsersRemoteManager(VkontakteManager):
         response = api_call('likes.getList', **kwargs)
         return response['users']
 
-    @transaction.commit_on_success
+    @atomic
     def fetch_instance_likes(self, instance, *args, **kwargs):
-        '''
-        Deprecated. will be removed in next release, after updating vkontakte_photos app
-        '''
+        """
+        DEPRECATED. will be removed in next release, after updating vkontakte_photos app
+        """
         m2m_field_name = kwargs.pop('m2m_field_name', 'like_users')
         m2m_model = getattr(instance, m2m_field_name).through
         try:
@@ -289,40 +269,41 @@ class UserRelative(models.Model):
 
 @python_2_unicode_compatible
 class User(VkontaktePKModel):
-
-    '''
+    """
     Model of vkontakte user
     TODO: implement relatives, schools and universities connections
     TODO: make field screen_name unique
-    '''
+    """
     resolve_screen_name_types = ['user']
     remote_pk_field = 'uid'
     slug_prefix = 'id'
 
-    first_name = models.CharField(max_length=200)
-    last_name = models.CharField(max_length=200)
-    screen_name = models.CharField(max_length=100, db_index=True)
+    first_name = models.CharField(max_length=32)
+    last_name = models.CharField(max_length=32)
+    screen_name = models.CharField(max_length=32, db_index=True)
+    nickname = models.CharField(max_length=32)
 
-    sex = models.IntegerField(null=True, choices=USER_SEX_CHOICES)
-    bdate = models.CharField(max_length=100)
+    sex = models.PositiveSmallIntegerField(null=True, choices=USER_SEX_CHOICES, db_index=True)
+    age = models.PositiveSmallIntegerField(null=True, db_index=True)
     timezone = models.IntegerField(null=True)
     city = models.ForeignKey(City, null=True, on_delete=models.SET_NULL)
     country = models.ForeignKey(Country, null=True, on_delete=models.SET_NULL)
-    rate = models.PositiveIntegerField(null=True)
+    rate = models.PositiveIntegerField(null=True, db_index=True)
+    bdate = models.CharField(max_length=10)
 
     activity = models.TextField()
-    relation = models.SmallIntegerField(null=True, choices=USER_RELATION_CHOICES)
+    relation = models.SmallIntegerField(null=True, choices=USER_RELATION_CHOICES, db_index=True)
     wall_comments = models.NullBooleanField()
 
     graduation = models.PositiveIntegerField(u'Дата окончания вуза', null=True)
     university = models.PositiveIntegerField(null=True)
-    university_name = models.CharField(max_length=500)
     faculty = models.PositiveIntegerField(null=True)
-    faculty_name = models.CharField(max_length=500)
+    university_name = models.CharField(max_length=255)
+    faculty_name = models.CharField(max_length=255)
 
-    has_mobile = models.NullBooleanField()
-    home_phone = models.CharField(max_length=50)
-    mobile_phone = models.CharField(max_length=50)
+    has_mobile = models.NullBooleanField(db_index=True)
+    home_phone = models.CharField(max_length=24)
+    mobile_phone = models.CharField(max_length=24)
 
     photo_fields = ['photo', 'photo_big', 'photo_medium', 'photo_medium_rec', 'photo_rec']
     photo = models.URLField()
@@ -332,11 +313,12 @@ class User(VkontaktePKModel):
     photo_rec = models.URLField()
 
     # social networks
-    twitter = models.CharField(max_length=500)
-    facebook = models.CharField(max_length=500)
-    facebook_name = models.CharField(max_length=500)
-    skype = models.CharField(max_length=500)
-    livejournal = models.CharField(max_length=500)
+    twitter = models.CharField(max_length=15)
+    instagram = models.CharField(max_length=30)
+    facebook = models.CharField(max_length=18)
+    facebook_name = models.CharField(max_length=50)
+    skype = models.CharField(max_length=32)  # in vk max_length=60
+    livejournal = models.CharField(max_length=31)
 
     # profile info
     interests = models.TextField()
@@ -346,10 +328,14 @@ class User(VkontaktePKModel):
     games = models.TextField()
     about = models.TextField()
 
+    # education
+    universities = JSONField(blank=True, null=True)
+    schools = JSONField(blank=True, null=True)
+
     friends_users = models.ManyToManyField('User', related_name='followers_users')
     friends_count = models.PositiveIntegerField(u'Друзей', default=0)
 
-#    relatives = models.ManyToManyField('User', through=UserRelative)
+    # relatives = models.ManyToManyField('User', through=UserRelative)
 
     # counters
     # TODO: migrate all counter fields to *_count = models.PositiveIntegerField(u'Фотоальбомов', null=True)
@@ -357,23 +343,24 @@ class User(VkontaktePKModel):
                 'notes', 'subscriptions', 'user_photos', 'user_videos', 'videos']
 
     sum_counters = models.PositiveIntegerField(default=0, help_text=u'Сумма всех счетчиков')
-    counters_updated = models.DateTimeField(null=True, help_text=u'Счетчики были обновлены')
+    counters_updated = models.DateTimeField(null=True, help_text=u'Счетчики были обновлены', db_index=True)
 
-    sum_counters = models.PositiveIntegerField(default=0, help_text=u'Сумма всех счетчиков')
     albums = models.PositiveIntegerField(u'Фотоальбомов', default=0)
     videos = models.PositiveIntegerField(u'Видеозаписей', default=0)
     audios = models.PositiveIntegerField(u'Аудиозаписей', default=0)
     followers = models.PositiveIntegerField(u'Подписчиков', default=0)
-    friends = models.PositiveIntegerField(u'Друзей', default=0)
+    friends = models.PositiveIntegerField(u'Друзей', default=0, db_index=True)
     mutual_friends = models.PositiveIntegerField(u'Общих друзей', default=0)
     notes = models.PositiveIntegerField(u'Заметок', default=0)
     subscriptions = models.PositiveIntegerField(u'Подписок (только пользователи)', default=0)
     user_photos = models.PositiveIntegerField(u'Фотографий с пользователем', default=0)
     user_videos = models.PositiveIntegerField(u'Видеозаписей с пользователем', default=0)
 
-    # extra fields, based on self.photo_fields
-    is_deactivated = models.BooleanField(u'Деактивирован?', default=False, db_index=True)
-    has_avatar = models.BooleanField(u'Есть аватар?', default=True, db_index=True)
+    # extra fields, based on self.photo_fields and api
+    is_deactivated = models.BooleanField(u'Деактивирован', default=False, db_index=True)
+    has_avatar = models.BooleanField(u'Есть аватар', default=True, db_index=True)
+    is_deleted = models.BooleanField(u'Удален', default=False)
+    is_banned = models.BooleanField(u'Забанен', default=False)
 
     objects = UsersManager()
     remote = UsersRemoteManager(remote_pk=('remote_id',), methods={
@@ -389,35 +376,79 @@ class User(VkontaktePKModel):
         return self.first_name + ' ' + self.last_name
 
     def save(self, *args, **kwargs):
-        # check strings for good encoding
-        # there is problems to save users with bad encoded activity strings like ID=88798245, ID=143523733
-        for field in ['activity', 'games', 'movies', 'tv', 'books', 'about', 'interests', 'mobile_phone', 'home_phone', 'faculty_name', 'university_name']:
-            try:
-                getattr(self, field).encode('utf-16').decode('utf-16')
-            except UnicodeDecodeError:
-                setattr(self, field, '')
+
+        # cut all CharFields to max allowed length
+        for field in self._meta.local_fields:
+            if isinstance(field, (models.CharField, models.TextField)):
+                value = getattr(self, field.name)
+                if isinstance(value, six.string_types):
+                    # check strings for bad symbols in string encoding
+                    # there is problems to save users with bad encoded activity strings like ID=88798245, ID=143523733
+                    try:
+                        value.encode('utf-16').decode('utf-16')
+                    except UnicodeDecodeError:
+                        value = ''
+                if isinstance(field, models.CharField) and value:
+                    value = value[:field.max_length]
+                setattr(self, field.name, value)
 
         if self.relation and self.relation not in dict(USER_RELATION_CHOICES).keys():
             self.relation = None
 
+        self.update()
+
         try:
             return super(User, self).save(*args, **kwargs)
-        except Exception, e:
+        except Exception:
             log.error("Error while saving user ID=%s with fields %s" % (self.remote_id, self.__dict__))
-            raise e
+            raise
 
-    @property
-    def age(self):
-        if len(self.bdate.split('.')) == 3:
+    def update(self):
+        self.update_age()
+        self.update_deactivated_status()
+        self.update_avatar_presence()
+        self.check_sex()
+        self.check_graduation()
+
+    def check_sex(self):
+        if self.sex not in [pair[0] for pair in USER_SEX_CHOICES]:
+            self.sex = None
+
+    def check_graduation(self):
+        if self.graduation == 0:
+            self.graduation = None
+
+    def update_age(self):
+        parts = self.bdate.split('.')
+        if len(parts) == 3:
             try:
-                return int((date.today() - parser.parse(self.bdate).date()).days / 365.25)
+                parts = map(int, parts)
+                born = date(parts[2], parts[1], parts[0])
             except ValueError:
-                pass
+                return
+            # Using solution from here
+            # http://stackoverflow.com/questions/2217488/age-from-birthdate-in-python/9754466#9754466
+            today = date.today()
+            self.age = today.year - born.year - ((today.month, today.day) < (born.month, born.day))
+
+    def update_deactivated_status(self):
+        self.is_deactivated = False
+        for field_name in self.photo_fields:
+            if USER_PHOTO_DEACTIVATED_URL in getattr(self, field_name):
+                self.is_deactivated = True
+                return
+
+    def update_avatar_presence(self):
+        self.has_avatar = True
+        for field_name in self.photo_fields:
+            if USER_NO_PHOTO_URL in getattr(self, field_name):
+                self.has_avatar = False
+                return
 
     def _substitute(self, old_instance):
-        '''
+        """
         Save counters fields while updating user
-        '''
+        """
         for counter in self.counters:
             setattr(self, counter, getattr(old_instance, counter))
 
@@ -427,11 +458,22 @@ class User(VkontaktePKModel):
         super(User, self)._substitute(old_instance)
 
     def parse(self, response):
+        if 'id' in response: # api version >= 5.23
+            self.remote_id = response['id']
 
         if 'city' in response:
-            self.city = City.objects.get_or_create(remote_id=response.pop('city'))[0]
+            city = response.pop('city')
+
+            if isinstance(city, dict): # api version >= 5.23
+                self.city = City.objects.get_or_create(remote_id=city['id'], defaults={'name':city['title']})[0]
+            else:
+                self.city = City.objects.get_or_create(remote_id=city)[0]
         if 'country' in response:
-            self.country = Country.objects.get_or_create(remote_id=response.pop('country'))[0]
+            country = response.pop('country')
+            if isinstance(country, dict): # api version >= 5.23
+                self.country = Country.objects.get_or_create(remote_id=country['id'], defaults={'name':country['title']})[0]
+            else:
+                self.country = Country.objects.get_or_create(remote_id=country)[0]
         if 'relatives' in response:
             relatives = response.pop('relatives')
             # doesn't work becouse of self.pk will be set lately
@@ -444,40 +486,26 @@ class User(VkontaktePKModel):
                         self.relative.add(user_relative)
                     except User.DoesNotExist:
                         continue
+        if 'deactivated' in response:
+            response['is_deactivated'] = True
+            response['is_deleted'] = response['deactivated'] == 'deleted'
+            response['is_banned'] = response['deactivated'] == 'banned'
+            response.pop('deactivated')
+
+        for field_name in ['status_audio', 'online', 'relation_partner', 'type']:
+            response.pop(field_name, None)
 
         super(User, self).parse(response)
-
-        self.parse_deactivated_status()
-        self.parse_avatar_presence()
-
-#        if 'uid' in response:
-#            self.remote_id = response['uid']
-
-        if self.graduation == 0:
-            self.graduation = None
 
     @property
     def refresh_kwargs(self):
         return {'ids': [self.remote_id]}
 
-    def parse_deactivated_status(self):
-        self.is_deactivated = False
-        for field_name in self.photo_fields:
-            if USER_PHOTO_DEACTIVATED_URL in getattr(self, field_name):
-                self.is_deactivated = True
-                return
-
-    def parse_avatar_presence(self):
-        self.has_avatar = True
-        for field_name in self.photo_fields:
-            if USER_NO_PHOTO_URL in getattr(self, field_name):
-                self.has_avatar = False
-                return
-
     def update_counters(self):
-        '''
+        """
         Update counters for user with special query and calculate sum of them
-        '''
+        """
+
         try:
             response = api_call('users.get', uids=self.remote_id, fields='counters')
         except VkontakteError, e:
@@ -509,15 +537,15 @@ class User(VkontaktePKModel):
         from vkontakte_wall.models import Post
         return Post.remote.fetch_wall(owner=self, *args, **kwargs)
 
-    @transaction.commit_on_success
+    @atomic
     def fetch_friends(self, **kwargs):
         log.debug("Start updating friends of user %s" % self)
         if self.is_deactivated:
             return False
 
         try:
+            log.debug("Fetch friends for user %s" % self)
             users = User.remote.fetch_friends(user=self, **kwargs)
-            log.debug("Found %d friends of user %s" % (len(users), self))
         except VkontakteError, e:
             if e.code == 15:
                 # update current user, make him deactivated
@@ -526,16 +554,17 @@ class User(VkontaktePKModel):
             else:
                 raise e
 
+        log.debug("Clear friends of user %s" % self)
         self.friends_users.clear()
-        log.debug("Cleared friends of user %s" % (self))
 
-        for user in users:
-            self.friends_users.add(user)
-        log.debug("New friends to user %s attached" % (self))
+        log.debug("Attach new friends to user %s" % self)
+        m2m = self.friends_users.through
+        m2m.objects.bulk_create([m2m(from_user_id=self.pk, to_user_id=user_id)
+                                 for user_id in users.values_list('pk', flat=True)])
 
+        log.debug("Update friends count of user %s" % self)
         self.friends_count = self.friends_users.count()
         self.save()
-        log.debug("Friends count %s of user %s updated" % (self.friends_count, self))
 
         return self.friends_users.all()
 
